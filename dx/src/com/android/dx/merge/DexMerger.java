@@ -39,8 +39,9 @@ import java.util.List;
  * Combine two dex files into one.
  */
 public final class DexMerger {
-    private final Dex dexA;
-    private final Dex dexB;
+    //private final Dex dexA;
+    //private final Dex dexB;
+    private final Dex[] dexes;
     private final CollisionPolicy collisionPolicy;
     private final WriterSizes writerSizes;
 
@@ -79,10 +80,12 @@ public final class DexMerger {
 
     private final TableOfContents contentsOut;
 
-    private final IndexMap aIndexMap;
-    private final IndexMap bIndexMap;
-    private final InstructionTransformer aInstructionTransformer;
-    private final InstructionTransformer bInstructionTransformer;
+    //private final IndexMap aIndexMap;
+    //private final IndexMap bIndexMap;
+    //private final InstructionTransformer aInstructionTransformer;
+    //private final InstructionTransformer bInstructionTransformer;
+    private final IndexMap[] indexMaps;
+    private final InstructionTransformer[] instructionTransformers;
 
     /** minimum number of wasted bytes before it's worthwhile to compact the result */
     private int compactWasteThreshold = 1024 * 1024; // 1MiB
@@ -93,20 +96,32 @@ public final class DexMerger {
     }
 
     private DexMerger(Dex dexA, Dex dexB, CollisionPolicy collisionPolicy,
-            WriterSizes writerSizes) throws IOException {
-        this.dexA = dexA;
-        this.dexB = dexB;
+                      WriterSizes writerSizes) throws IOException {
+        this(collisionPolicy, writerSizes, dexA, dexB);
+    }
+
+    public DexMerger(CollisionPolicy collisionPolicy,
+                     Dex... dexes) throws IOException {
+        this(collisionPolicy, new WriterSizes(dexes), dexes);
+    }
+
+
+    private DexMerger(CollisionPolicy collisionPolicy,
+                      WriterSizes writerSizes,
+                      Dex... dexes) throws IOException {
+        this.dexes = dexes;
         this.collisionPolicy = collisionPolicy;
         this.writerSizes = writerSizes;
 
         dexOut = new Dex(writerSizes.size());
 
-        TableOfContents aContents = dexA.getTableOfContents();
-        TableOfContents bContents = dexB.getTableOfContents();
-        aIndexMap = new IndexMap(dexOut, aContents);
-        bIndexMap = new IndexMap(dexOut, bContents);
-        aInstructionTransformer = new InstructionTransformer(aIndexMap);
-        bInstructionTransformer = new InstructionTransformer(bIndexMap);
+        indexMaps = new IndexMap[dexes.length];
+        instructionTransformers = new InstructionTransformer[dexes.length];
+        for (int i = 0; i < dexes.length; i++) {
+            TableOfContents contents = dexes[i].getTableOfContents();
+            indexMaps[i] = new IndexMap(dexOut, contents);
+            instructionTransformers[i] = new InstructionTransformer(indexMaps[i]);
+        }
 
         headerOut = dexOut.appendSection(writerSizes.header, "header");
         idsDefsOut = dexOut.appendSection(writerSizes.idsDefs, "ids defs");
@@ -193,7 +208,7 @@ public final class DexMerger {
          */
         WriterSizes compactedSizes = new WriterSizes(this);
         int wastedByteCount = writerSizes.size() - compactedSizes.size();
-        if (wastedByteCount >  + compactWasteThreshold) {
+        //if (wastedByteCount >  + compactWasteThreshold) {
             DexMerger compacter = new DexMerger(
                     dexOut, new Dex(0), CollisionPolicy.FAIL, compactedSizes);
             result = compacter.mergeDexes();
@@ -201,9 +216,10 @@ public final class DexMerger {
                     dexOut.getLength() / 1024f,
                     result.getLength() / 1024f,
                     wastedByteCount / 1024f);
-        }
+        //}
 
         long elapsed = System.nanoTime() - start;
+        /*
         System.out.printf("Merged dex A (%d defs/%.1fKiB) with dex B "
                 + "(%d defs/%.1fKiB). Result is %d defs/%.1fKiB. Took %.1fs%n",
                 dexA.getTableOfContents().classDefs.size,
@@ -213,6 +229,8 @@ public final class DexMerger {
                 result.getTableOfContents().classDefs.size,
                 result.getLength() / 1024f,
                 elapsed / 1000000000f);
+          */
+        System.out.printf("Merged %d dexes. Took %1fs%n", dexes.length, elapsed / 1000000000f);
 
         return result;
     }
@@ -233,59 +251,26 @@ public final class DexMerger {
          * at a time.
          */
         public final void mergeSorted() {
-            TableOfContents.Section aSection = getSection(dexA.getTableOfContents());
-            TableOfContents.Section bSection = getSection(dexB.getTableOfContents());
+
             getSection(contentsOut).off = out.getPosition();
 
-            Dex.Section inA = aSection.exists() ? dexA.open(aSection.off) : null;
-            Dex.Section inB = bSection.exists() ? dexB.open(bSection.off) : null;
-            int aOffset = -1;
-            int bOffset = -1;
-            int aIndex = 0;
-            int bIndex = 0;
+            List<UnsortedValue> all = new ArrayList<UnsortedValue>();
+            for (int i = 0; i < dexes.length; i++) {
+                all.addAll(readUnsortedValues(dexes[i], indexMaps[i]));
+            }
+            Collections.sort(all);
+
             int outCount = 0;
-            T a = null;
-            T b = null;
+            for (int i = 0; i < all.size(); ) {
+                UnsortedValue e1 = all.get(i++);
+                updateIndex(e1.offset, getIndexMap(e1.source), e1.index, outCount);
 
-            while (true) {
-                if (a == null && aIndex < aSection.size) {
-                    aOffset = inA.getPosition();
-                    a = read(inA, aIndexMap, aIndex);
-                }
-                if (b == null && bIndex < bSection.size) {
-                    bOffset = inB.getPosition();
-                    b = read(inB, bIndexMap, bIndex);
+                while (i < all.size() && e1.compareTo(all.get(i)) == 0) {
+                    UnsortedValue e2 = all.get(i++);
+                    updateIndex(e2.offset, getIndexMap(e2.source), e2.index, outCount);
                 }
 
-                // Write the smaller of a and b. If they're equal, write only once
-                boolean advanceA;
-                boolean advanceB;
-                if (a != null && b != null) {
-                    int compare = a.compareTo(b);
-                    advanceA = compare <= 0;
-                    advanceB = compare >= 0;
-                } else {
-                    advanceA = (a != null);
-                    advanceB = (b != null);
-                }
-
-                T toWrite = null;
-                if (advanceA) {
-                    toWrite = a;
-                    updateIndex(aOffset, aIndexMap, aIndex++, outCount);
-                    a = null;
-                    aOffset = -1;
-                }
-                if (advanceB) {
-                    toWrite = b;
-                    updateIndex(bOffset, bIndexMap, bIndex++, outCount);
-                    b = null;
-                    bOffset = -1;
-                }
-                if (toWrite == null) {
-                    break; // advanceA == false && advanceB == false
-                }
-                write(toWrite);
+                write(e1.value);
                 outCount++;
             }
 
@@ -300,8 +285,9 @@ public final class DexMerger {
             getSection(contentsOut).off = out.getPosition();
 
             List<UnsortedValue> all = new ArrayList<UnsortedValue>();
-            all.addAll(readUnsortedValues(dexA, aIndexMap));
-            all.addAll(readUnsortedValues(dexB, bIndexMap));
+            for (int i = 0; i < dexes.length; i++) {
+                all.addAll(readUnsortedValues(dexes[i], indexMaps[i]));
+            }
             Collections.sort(all);
 
             int outCount = 0;
@@ -364,13 +350,12 @@ public final class DexMerger {
     }
 
     private IndexMap getIndexMap(Dex dex) {
-        if (dex == dexA) {
-            return aIndexMap;
-        } else if (dex == dexB) {
-            return bIndexMap;
-        } else {
-            throw new IllegalArgumentException();
+        for (int i = 0; i < dexes.length; i++) {
+            if (dex == dexes[i]) {
+                return indexMaps[i];
+            }
         }
+        throw new IllegalArgumentException();
     }
 
     private void mergeStringIds() {
@@ -535,7 +520,7 @@ public final class DexMerger {
 
         for (SortableType type : types) {
             Dex in = type.getDex();
-            IndexMap indexMap = (in == dexA) ? aIndexMap : bIndexMap;
+            IndexMap indexMap = getIndexMap(in);
             transformClassDef(in, type.getClassDef(), indexMap);
         }
     }
@@ -547,8 +532,9 @@ public final class DexMerger {
     private SortableType[] getSortedTypes() {
         // size is pessimistic; doesn't include arrays
         SortableType[] sortableTypes = new SortableType[contentsOut.typeIds.size];
-        readSortableTypes(sortableTypes, dexA, aIndexMap);
-        readSortableTypes(sortableTypes, dexB, bIndexMap);
+        for (int i = 0; i < dexes.length; i++) {
+            readSortableTypes(sortableTypes, dexes[i], indexMaps[i]);
+        }
 
         /*
          * Populate the depths of each sortable type. This makes D iterations
@@ -603,14 +589,18 @@ public final class DexMerger {
      * We should shrink the output by merging rather than unioning
      */
     private void unionAnnotationSetsAndDirectories() {
-        transformAnnotationSets(dexA, aIndexMap);
-        transformAnnotationSets(dexB, bIndexMap);
-        transformAnnotationSetRefLists(dexA, aIndexMap);
-        transformAnnotationSetRefLists(dexB, bIndexMap);
-        transformAnnotationDirectories(dexA, aIndexMap);
-        transformAnnotationDirectories(dexB, bIndexMap);
-        transformStaticValues(dexA, aIndexMap);
-        transformStaticValues(dexB, bIndexMap);
+        for (int i = 0; i < dexes.length; i++) {
+            transformAnnotationSets(dexes[i], indexMaps[i]);
+        }
+        for (int i = 0; i < dexes.length; i++) {
+            transformAnnotationSetRefLists(dexes[i], indexMaps[i]);
+        }
+        for (int i = 0; i < dexes.length; i++) {
+            transformAnnotationDirectories(dexes[i], indexMaps[i]);
+        }
+        for (int i = 0; i < dexes.length; i++) {
+            transformStaticValues(dexes[i], indexMaps[i]);
+        }
     }
 
     private void transformAnnotationSets(Dex in, IndexMap indexMap) {
@@ -833,9 +823,15 @@ public final class DexMerger {
         }
 
         short[] instructions = code.getInstructions();
-        InstructionTransformer transformer = (in == dexA)
-                ? aInstructionTransformer
-                : bInstructionTransformer;
+        InstructionTransformer transformer = null;
+        for (int i = 0; i < dexes.length; i++) {
+            if (in == dexes[i]) {
+                transformer = instructionTransformers[i];
+            }
+        }
+        if (transformer == null) {
+            throw new RuntimeException("no transformer found");
+        }
         short[] newInstructions = transformer.transform(instructions);
         codeOut.writeInt(newInstructions.length);
         codeOut.write(newInstructions);
@@ -1022,6 +1018,14 @@ public final class DexMerger {
             plus(a.getTableOfContents(), false);
             plus(b.getTableOfContents(), false);
             fourByteAlign();
+        }
+
+        public WriterSizes(Dex... dexes) {
+            for (int i = 0; i < dexes.length; i++) {
+                plus(dexes[i].getTableOfContents(), false);
+            }
+            fourByteAlign();
+
         }
 
         public WriterSizes(DexMerger dexMerger) {
