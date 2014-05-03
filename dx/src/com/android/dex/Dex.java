@@ -291,16 +291,25 @@ public final class Dex {
         } catch (NoSuchAlgorithmException e) {
             throw new AssertionError();
         }
-        byte[] buffer = new byte[8192];
+        //byte[] buffer = new byte[8192];
         ByteBuffer data = this.data.duplicate(); // positioned ByteBuffers aren't thread safe
         data.limit(data.capacity());
         data.position(SIGNATURE_OFFSET + SIGNATURE_SIZE);
+
+        byte[] buffer = new byte[data.remaining()];
+        data.get(buffer);
+        System.out.printf("compute signature size=%d\n", buffer.length);
+        return digest.digest(buffer);
+        /*
         while (data.hasRemaining()) {
+
             int count = Math.min(buffer.length, data.remaining());
+            System.out.printf("compute signature size=%d\n", count);
             data.get(buffer, 0, count);
             digest.update(buffer, 0, count);
         }
         return digest.digest();
+        */
     }
 
     /**
