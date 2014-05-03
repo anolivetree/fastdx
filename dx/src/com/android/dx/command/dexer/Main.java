@@ -27,6 +27,7 @@ import com.android.dx.cf.direct.ClassPathOpener.FileNameFilter;
 import com.android.dx.cf.direct.DirectClassFile;
 import com.android.dx.cf.direct.StdAttributeFactory;
 import com.android.dx.cf.iface.ParseException;
+import com.android.dx.command.DexCache;
 import com.android.dx.command.DxConsole;
 import com.android.dx.command.UsageException;
 import com.android.dx.dex.DexOptions;
@@ -38,6 +39,7 @@ import com.android.dx.dex.file.AnnotationUtils;
 import com.android.dx.dex.file.ClassDefItem;
 import com.android.dx.dex.file.DexFile;
 import com.android.dx.dex.file.EncodedMethod;
+import com.android.dx.merge.MergeCache;
 import com.android.dx.merge.CollisionPolicy;
 import com.android.dx.merge.DexMerger;
 import com.android.dx.rop.annotation.Annotation;
@@ -164,7 +166,7 @@ public class Main {
     private static TreeMap<String, byte[]> outputResources;
 
     /** Library .dex files to merge into the output .dex. */
-    private static final List<byte[]> libraryDexBuffers = new ArrayList<byte[]>();
+    private static final List<LibraryDexInfo> libraryDexBuffers = new ArrayList<LibraryDexInfo>();
 
     /** thread pool object used for multi-threaded file processing */
     private static ExecutorService threadPool;
@@ -231,6 +233,7 @@ public class Main {
             }
         } finally {
             closeOutput(humanOutRaw);
+            DexCache.getInstance().trim();
         }
     }
 
@@ -332,6 +335,38 @@ public class Main {
 
         if (args.jarOutput) {
 
+            if (dexOutputArrays.size() > 1) {
+                byte[] outArray = null;
+
+
+                Dex[] dexes = new Dex[dexOutputArrays.size()];
+                for (int i = 0; i < dexes.length; i++) {
+                    dexes[i] = new Dex(dexOutputArrays.get(i));
+                }
+
+                Dex ab = new DexMerger(CollisionPolicy.FAIL, dexes).merge();
+                outArray = ab.getBytes();
+
+                /*
+                for (byte[] data : dexOutputArrays) {
+                    if (outArray == null) {
+                        outArray = data;
+                        continue;
+                    }
+
+                    Dex a = new Dex(outArray);
+                    Dex b = new Dex(data);
+                    Dex ab = new DexMerger(a, b, CollisionPolicy.FAIL).merge();
+                    outArray = ab.getBytes();
+                }
+                */
+
+                dexOutputArrays.clear();
+                dexOutputArrays.add(outArray);
+            }
+
+
+
             for (int i = 0; i < dexOutputArrays.size(); i++) {
                 outputResources.put(getDexFileName(i),
                         dexOutputArrays.get(i));
@@ -428,19 +463,55 @@ public class Main {
      * same type, this fails with an exception.
      */
     private static byte[] mergeLibraryDexBuffers(byte[] outArray) throws IOException {
-        for (byte[] libraryDex : libraryDexBuffers) {
-            if (outArray == null) {
-                outArray = libraryDex;
-                continue;
-            }
 
-            Dex a = new Dex(outArray);
-            Dex b = new Dex(libraryDex);
-            Dex ab = new DexMerger(a, b, CollisionPolicy.FAIL).merge();
-            outArray = ab.getBytes();
+        if (outArray != null) {
+            System.out.printf("merge outArray!=null\n");
+            libraryDexBuffers.add(new LibraryDexInfo(outArray, 0, null));
+            outArray = null;
         }
 
+
+        Dex[] dexes = new Dex[libraryDexBuffers.size()];
+        for (int i = 0; i < dexes.length; i++) {
+            dexes[i] = new Dex(libraryDexBuffers.get(i).data);
+        }
+        Dex ab = new DexMerger(CollisionPolicy.FAIL, dexes).merge();
+        outArray = ab.getBytes();
+
+        // TODO use MergeCache. Need to save caches in DexMerger.
+
         return outArray;
+
+        /*
+        MergeCache cache = MergeCache.getInstance();
+
+        List<LibraryDexInfo> dexes = cache.reorder(outArray, libraryDexBuffers);
+
+        String mergeSource = "";
+
+
+        for (LibraryDexInfo libraryDex : dexes) {
+
+            if (outArray == null) {
+                outArray = libraryDex.data;
+                mergeSource += libraryDex.hashStr;
+                continue;
+            } else {
+                mergeSource += libraryDex.hashStr;
+            }
+
+            System.out.printf("merge hash=%s len=%d\n", DexCache.getInstance().hash(outArray), outArray.length);
+            Dex a = new Dex(outArray);
+            Dex b = new Dex(libraryDex.data);
+            Dex ab = new DexMerger(a, b, CollisionPolicy.FAIL).merge();
+            outArray = ab.getBytes();
+            cache.add(mergeSource, outArray);
+        }
+
+        cache.saveCacheIndex();
+
+        return outArray;
+        */
     }
 
     /**
@@ -631,10 +702,18 @@ public class Main {
             if (lastModified < minimumFileAge) {
                 return true;
             }
-            return processClass(fixedName, bytes);
+            byte[] dex = processClass2(fixedName, bytes);
+            if (dex != null) {
+                synchronized (libraryDexBuffers) {
+                    libraryDexBuffers.add(new LibraryDexInfo(dex, lastModified, null));
+                }
+                return true;
+            } else {
+                return false;
+            }
         } else if (isClassesDex) {
             synchronized (libraryDexBuffers) {
-                libraryDexBuffers.add(bytes);
+                libraryDexBuffers.add(new LibraryDexInfo(bytes, lastModified, null));
             }
             return true;
         } else {
@@ -669,13 +748,17 @@ public class Main {
         int numTypeIds = outputDex.getTypeIds().items().size();
         int constantPoolSize = cf.getConstantPool().size();
 
-        if (args.multiDex && ((numMethodIds + constantPoolSize > args.maxNumberOfIdxPerDex) ||
-            (numFieldIds + constantPoolSize > args.maxNumberOfIdxPerDex) ||
-            (numTypeIds + constantPoolSize
+        if (false) {
+            if (args.multiDex && ((numMethodIds + constantPoolSize > args.maxNumberOfIdxPerDex) ||
+                    (numFieldIds + constantPoolSize > args.maxNumberOfIdxPerDex) ||
+                    (numTypeIds + constantPoolSize
                     /* annotation added by dx are not counted in numTypeIds */
-                    + AnnotationUtils.DALVIK_ANNOTATION_NUMBER
-                    > args.maxNumberOfIdxPerDex))) {
-          createDexFile();
+                            + AnnotationUtils.DALVIK_ANNOTATION_NUMBER
+                            > args.maxNumberOfIdxPerDex))) {
+                createDexFile();
+            }
+        } else {
+            createDexFile();
         }
 
         try {
@@ -696,6 +779,59 @@ public class Main {
         }
         errors++;
         return false;
+    }
+
+    private static byte[] processClass2(String name, byte[] bytes) {
+        if (! args.coreLibrary) {
+            checkClassName(name);
+        }
+
+        byte[] dexCache = DexCache.getInstance().getDex(bytes);
+        if (dexCache != null) {
+            DxConsole.out.println("dexcache match name=" + name);
+            return dexCache;
+        } else {
+            DxConsole.out.println("dexcache doesn't match name=" + name);
+        }
+
+        DirectClassFile cf =
+                new DirectClassFile(bytes, name, args.cfOptions.strictNameCheck);
+
+        // Do we need this??
+        cf.setAttributeFactory(StdAttributeFactory.THE_ONE);
+        cf.getMagic();
+
+        DexFile dexFile = new DexFile(args.dexOptions);
+
+        try {
+            ClassDefItem clazz =
+                    CfTranslator.translate(cf, bytes, args.cfOptions, args.dexOptions, dexFile);
+            dexFile.add(clazz);
+            byte[] dex = dexFile.toDex(humanOutWriter, args.verboseDump);
+            if (dex != null) {
+                DexCache.getInstance().putDex(bytes, dex);
+                DxConsole.out.println("save dexcache");
+            }
+            return dex;
+        } catch (ParseException ex) {
+            DxConsole.err.println("\ntrouble processing:");
+            if (args.debug) {
+                ex.printStackTrace(DxConsole.err);
+            } else {
+                ex.printContext(DxConsole.err);
+            }
+        } catch (IOException e) {
+            DxConsole.err.println("\ntrouble processing:");
+        } finally {
+            if (humanOutWriter != null) {
+                try {
+                    humanOutWriter.flush();
+                } catch (IOException e) {
+                }
+            }
+        }
+        errors++;
+        return null;
     }
 
     /**
@@ -1546,6 +1682,18 @@ public class Main {
             if (Main.processFileBytes(path, lastModified, bytes)) {
                 anyFilesProcessed = true;
             }
+        }
+    }
+
+    static public class LibraryDexInfo {
+        final public byte[] data;
+        final public long timestamp;
+        final public String hashStr;
+
+        public LibraryDexInfo(byte[] data, long timestamp, String hashStr) {
+            this.data = data;
+            this.timestamp = timestamp;
+            this.hashStr = hashStr;
         }
     }
 }
